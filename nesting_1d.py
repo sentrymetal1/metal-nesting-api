@@ -1,25 +1,18 @@
 """
 1D Linear Nesting - Multi-Stock Best-Fit Decreasing
 Algorithm:
-  1. Sort all available stock sizes DESCENDING (longest first)
-  2. Sort all parts DESCENDING by length (longest first)
-  3. For the longest stock, pack as many parts as possible (best-fit)
-  4. Once a stock piece is full, open a new stock piece at the same length
-  5. When no more parts fit the current stock length, step down to next shorter stock
-  6. Each stock piece is filled to maximize usage (minimize waste)
+  1. Sort all parts DESCENDING by length (longest first)
+  2. For each part, find the shortest stock that fits it
+  3. Try to pack it into an existing open bin of that stock size
+  4. If no bin has room, open a new bin at the shortest viable stock size
+  5. Pack as many additional parts as possible into each bin
+  6. After all packing, downsize any bin that could use shorter stock
 
 Stock matching: form_type + material_origin
 """
 
 
 def nest_1d(parts, stock_options, kerf):
-    """
-    parts: list of dicts with part_mark, bom_line_id, form_type, material_type,
-           material_origin, spec_name, density, length_in, quantity
-    stock_options: list of dicts with stock_id, stock_label, form_type,
-                   material_origin, density, length_in, is_standard
-    """
-
     # Group parts by form_type + material_origin
     groups = {}
     for part in parts:
@@ -60,112 +53,99 @@ def nest_1d(parts, stock_options, kerf):
             })
             continue
 
-        # Sort parts longest first
-        remaining_cuts = sorted(cuts, key=lambda c: c["length_in"], reverse=True)
-
-        # Get unique stock lengths, sorted DESCENDING (longest first)
+        # Build stock lookup: length -> stock record, sorted ascending
         stock_by_length = {}
         for s in matching_stock:
             length = float(s["length_in"])
             if length not in stock_by_length:
                 stock_by_length[length] = s
-        available_lengths = sorted(stock_by_length.keys(), reverse=True)
+        available_lengths = sorted(stock_by_length.keys())  # shortest first
 
-        if not available_lengths:
-            stock_results.append({
-                "error": f"No viable stock lengths for: {form_type} | {mat_origin}.",
-                "form_type": form_type,
-                "material_origin": mat_origin
-            })
-            continue
+        # Sort parts longest first
+        remaining_cuts = sorted(cuts, key=lambda c: c["length_in"], reverse=True)
 
-        # Check if longest stock can fit the longest part
+        # Check if any stock can fit the longest part
         max_cut = max(c["length_in"] for c in remaining_cuts)
-        max_stock = available_lengths[0]
+        max_stock = max(available_lengths)
         if max_stock < max_cut:
             stock_results.append({
-                "error": f"No stock long enough for {form_type} | {mat_origin}. Largest part: {max_cut}\", longest stock: {max_stock}\". Add longer stock.",
+                "error": f"No stock long enough for {form_type} | {mat_origin}. Largest part: {max_cut}\", longest stock: {max_stock}\".",
                 "form_type": form_type,
                 "material_origin": mat_origin
             })
             continue
 
-        # --- Multi-stock best-fit packing ---
+        # --- Best-fit packing: for each part, find shortest stock that works ---
         bins = []
 
-        # Process each stock length from longest to shortest
-        for stock_length in available_lengths:
-            if not remaining_cuts:
-                break
+        for cut in remaining_cuts:
+            cut_len = cut["length_in"]
+            needed = cut_len + kerf
 
-            chosen_stock = stock_by_length[stock_length]
+            # Try to fit into an existing bin (prefer bin with least remaining space that still fits)
+            best_bin = None
+            best_remaining = float("inf")
+            for b in bins:
+                if b["remaining"] >= needed and b["remaining"] - needed < best_remaining:
+                    best_bin = b
+                    best_remaining = b["remaining"] - needed
 
-            # Keep opening bins at this stock length as long as parts fit
-            while remaining_cuts:
-                # Find parts that fit this stock length
-                fits_any = False
-                for cut in remaining_cuts:
-                    if cut["length_in"] + kerf <= stock_length:
-                        fits_any = True
+            if best_bin:
+                best_bin["cuts"].append({
+                    "part_mark":     cut["part_mark"],
+                    "bom_line_id":   cut["bom_line_id"],
+                    "material_type": cut["material_type"],
+                    "spec_name":     cut["spec_name"],
+                    "cut_length":    cut["length_in"],
+                    "kerf":          kerf
+                })
+                best_bin["remaining"] -= needed
+            else:
+                # Open a new bin — find shortest stock that fits this part
+                chosen_length = None
+                for sl in available_lengths:
+                    if sl >= needed:
+                        chosen_length = sl
                         break
 
-                if not fits_any:
-                    break  # No remaining parts fit this stock length, try shorter
+                if chosen_length is None:
+                    stock_results.append({
+                        "error": f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}.",
+                        "form_type": form_type,
+                        "material_origin": mat_origin
+                    })
+                    continue
 
-                # Open a new bin at this stock length
-                current_bin = {
-                    "stock_length": stock_length,
-                    "chosen_stock": chosen_stock,
-                    "remaining": stock_length,
-                    "cuts": []
+                new_bin = {
+                    "stock_length": chosen_length,
+                    "chosen_stock": stock_by_length[chosen_length],
+                    "remaining": chosen_length - needed,
+                    "cuts": [{
+                        "part_mark":     cut["part_mark"],
+                        "bom_line_id":   cut["bom_line_id"],
+                        "material_type": cut["material_type"],
+                        "spec_name":     cut["spec_name"],
+                        "cut_length":    cut["length_in"],
+                        "kerf":          kerf
+                    }]
                 }
+                bins.append(new_bin)
 
-                # Pack as many parts as possible into this bin (best-fit)
-                # Try each remaining part, largest first
-                still_remaining = []
-                for cut in remaining_cuts:
-                    needed = cut["length_in"] + kerf
-                    if current_bin["remaining"] >= needed:
-                        current_bin["cuts"].append({
-                            "part_mark":     cut["part_mark"],
-                            "bom_line_id":   cut["bom_line_id"],
-                            "material_type": cut["material_type"],
-                            "spec_name":     cut["spec_name"],
-                            "cut_length":    cut["length_in"],
-                            "kerf":          kerf
-                        })
-                        current_bin["remaining"] -= needed
-                    else:
-                        still_remaining.append(cut)
-
-                if current_bin["cuts"]:
-                    bins.append(current_bin)
-
-                remaining_cuts = sorted(still_remaining, key=lambda c: c["length_in"], reverse=True)
-
-        # Handle any parts that couldn't be placed (shouldn't happen if stock is adequate)
-        if remaining_cuts:
-            stock_results.append({
-                "error": f"Could not place {len(remaining_cuts)} cuts for {form_type} | {mat_origin}. Parts may be longer than available stock.",
-                "form_type": form_type,
-                "material_origin": mat_origin
-            })
-
-        # --- Optimization pass: try to consolidate bins ---
+        # --- Optimization: try to consolidate bins ---
         bins = _optimize_bins(bins, kerf)
 
-        # --- Try to downsize bins to shorter stock where possible ---
+        # --- Final downsize: shrink each bin to shortest viable stock ---
         bins = _downsize_bins(bins, available_lengths, stock_by_length, kerf)
 
         # --- Build result records ---
         for b in bins:
             stock_length = b["stock_length"]
             chosen_stock = b["chosen_stock"]
-            used_length = stock_length - b["remaining"]
-            waste_pct = round((b["remaining"] / stock_length) * 100, 2)
+            used_length = sum(c["cut_length"] + kerf for c in b["cuts"])
+            remaining = stock_length - used_length
+            waste_pct = round((remaining / stock_length) * 100, 2) if stock_length > 0 else 0
             weight = _calc_weight_1d(chosen_stock, used_length, density)
 
-            # Group cuts by part_mark + length
             cut_summary = {}
             for c in b["cuts"]:
                 k = (c["part_mark"], c["cut_length"])
@@ -190,7 +170,7 @@ def nest_1d(parts, stock_options, kerf):
                 "stock_label":       chosen_stock["stock_label"],
                 "stock_length_in":   stock_length,
                 "stock_width_in":    None,
-                "remnant_length_in": round(b["remaining"], 4),
+                "remnant_length_in": round(max(remaining, 0), 4),
                 "waste_percentage":  waste_pct,
                 "stock_weight_lbs":  round(weight, 3),
                 "cuts":              list(cut_summary.values())
@@ -201,34 +181,39 @@ def nest_1d(parts, stock_options, kerf):
 
 
 def _optimize_bins(bins, kerf):
-    """Try to move cuts from one bin to another to eliminate bins entirely."""
+    """Try to move all cuts from one bin into others to eliminate bins."""
     improved = True
     while improved:
         improved = False
-        # Sort bins by remaining space descending (most empty first — candidates for elimination)
-        bins.sort(key=lambda b: b["remaining"], reverse=True)
-        for i in range(len(bins) - 1, -1, -1):
+        bins.sort(key=lambda b: len(b["cuts"]))  # fewest cuts first = easiest to empty
+        for i in range(len(bins)):
             if not bins[i]["cuts"]:
                 continue
             # Try to move ALL cuts from bin[i] to other bins
-            all_moved = True
             moves = []
+            all_moved = True
             for cut in bins[i]["cuts"]:
+                needed = cut["cut_length"] + kerf
                 placed = False
+                # Find best-fit target (least remaining space after placement)
+                best_j = None
+                best_rem = float("inf")
                 for j in range(len(bins)):
                     if i == j:
                         continue
-                    needed = cut["cut_length"] + kerf
                     if bins[j]["remaining"] >= needed:
-                        moves.append((cut, j))
-                        placed = True
-                        break
+                        rem_after = bins[j]["remaining"] - needed
+                        if rem_after < best_rem:
+                            best_j = j
+                            best_rem = rem_after
+                if best_j is not None:
+                    moves.append((cut, best_j))
+                    placed = True
                 if not placed:
                     all_moved = False
                     break
 
             if all_moved and moves:
-                # Execute all moves — eliminate bin[i]
                 for cut, target_idx in moves:
                     bins[target_idx]["cuts"].append(cut)
                     bins[target_idx]["remaining"] -= (cut["cut_length"] + kerf)
@@ -240,25 +225,24 @@ def _optimize_bins(bins, kerf):
 
 
 def _downsize_bins(bins, available_lengths, stock_by_length, kerf):
-    """After packing, check if any bin can use a shorter stock size."""
-    sorted_lengths = sorted(available_lengths)  # shortest first
-
+    """Shrink each bin to the shortest stock that fits all its cuts."""
     for b in bins:
         total_needed = sum(c["cut_length"] + kerf for c in b["cuts"])
-        # Find the shortest stock that fits all cuts in this bin
-        for length in sorted_lengths:
-            if length >= total_needed:
-                if length < b["stock_length"]:
-                    b["stock_length"] = length
-                    b["chosen_stock"] = stock_by_length[length]
-                    b["remaining"] = length - total_needed
+        # Find shortest stock that fits
+        for sl in available_lengths:  # already sorted ascending
+            if sl >= total_needed:
+                if sl < b["stock_length"]:
+                    b["stock_length"] = sl
+                    b["chosen_stock"] = stock_by_length[sl]
+                    b["remaining"] = sl - total_needed
+                elif sl == b["stock_length"]:
+                    # Recalculate remaining in case it drifted
+                    b["remaining"] = sl - total_needed
                 break
-
     return bins
 
 
 def _calc_weight_1d(stock, used_length_in, density):
-    """Weight calculation."""
     if not density or density == 0:
         return 0
     area_in2 = float(stock.get("area_in2", 0) or 0)
