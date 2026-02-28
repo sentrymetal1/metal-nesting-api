@@ -1,50 +1,32 @@
 """
-1D Linear Nesting - First Fit Decreasing + Local Swap Optimization
+1D Linear Nesting - Multi-Stock Best-Fit Decreasing
+Algorithm:
+  1. Sort all available stock sizes DESCENDING (longest first)
+  2. Sort all parts DESCENDING by length (longest first)
+  3. For the longest stock, pack as many parts as possible (best-fit)
+  4. Once a stock piece is full, open a new stock piece at the same length
+  5. When no more parts fit the current stock length, step down to next shorter stock
+  6. Each stock piece is filled to maximize usage (minimize waste)
+
 Stock matching: form_type + material_origin
-  - form_type:      e.g. "Structural And Pipe", "Flat"
-  - material_origin: e.g. "Carbon Steel", "Aluminum", "Stainless Steel"
-    (comes from Specification.Material_Type_Origin in Zoho)
-    Any new values added to Zoho core tables are captured automatically.
 """
 
 
 def nest_1d(parts, stock_options, kerf):
     """
-    parts: list of dicts:
-        {
-            "part_mark":       "A1",
-            "bom_line_id":     "12345",
-            "form_type":       "Structural And Pipe",
-            "material_type":   "Angle",        # display only
-            "material_origin": "Carbon Steel", # used for stock matching
-            "spec_name":       "A36",          # display only
-            "density":         0.2833,
-            "length_in":       48.5,
-            "quantity":        4
-        }
-
-    stock_options: list of dicts:
-        {
-            "stock_id":        "STK-001",
-            "stock_label":     "Structural And Pipe | Carbon Steel | 20ft",
-            "form_type":       "Structural And Pipe",
-            "material_origin": "Carbon Steel",
-            "density":         0.2833,
-            "length_in":       240.0,
-            "thickness_in":    0.25,
-            "width_in":        2.0,
-            "is_standard":     True
-        }
+    parts: list of dicts with part_mark, bom_line_id, form_type, material_type,
+           material_origin, spec_name, density, length_in, quantity
+    stock_options: list of dicts with stock_id, stock_label, form_type,
+                   material_origin, density, length_in, is_standard
     """
 
     # Group parts by form_type + material_origin
-    # This means all Angle, Channel, Beam etc. of same origin nest from same stock pool
     groups = {}
     for part in parts:
         key = (part["form_type"], part["material_origin"])
         if key not in groups:
             groups[key] = {
-                "cuts":    [],
+                "cuts": [],
                 "density": part.get("density", 0)
             }
         for _ in range(int(part["quantity"])):
@@ -60,10 +42,10 @@ def nest_1d(parts, stock_options, kerf):
     stock_sequence = 1
 
     for (form_type, mat_origin), group_data in groups.items():
-        cuts    = group_data["cuts"]
+        cuts = group_data["cuts"]
         density = group_data["density"]
 
-        # Match stock by form_type + material_origin (case-insensitive, trimmed)
+        # Match stock by form_type + material_origin
         matching_stock = [
             s for s in stock_options
             if s["form_type"].strip().lower() == form_type.strip().lower()
@@ -72,75 +54,118 @@ def nest_1d(parts, stock_options, kerf):
 
         if not matching_stock:
             stock_results.append({
-                "error":           f"No stock found in library for: {form_type} | {mat_origin}. Add a matching record to Nesting_Stock_Library.",
-                "form_type":       form_type,
+                "error": f"No stock found for: {form_type} | {mat_origin}. Add to Nesting_Stock_Library.",
+                "form_type": form_type,
                 "material_origin": mat_origin
             })
             continue
 
-        # Sort cuts largest first (FFD)
-        cuts_sorted = sorted(cuts, key=lambda c: c["length_in"], reverse=True)
-        max_cut     = max(c["length_in"] for c in cuts_sorted)
+        # Sort parts longest first
+        remaining_cuts = sorted(cuts, key=lambda c: c["length_in"], reverse=True)
 
-        # Find viable stock — must accommodate the largest part
-        viable_stock = [
-            s for s in matching_stock
-            if float(s["length_in"]) >= max_cut
-        ]
+        # Get unique stock lengths, sorted DESCENDING (longest first)
+        stock_by_length = {}
+        for s in matching_stock:
+            length = float(s["length_in"])
+            if length not in stock_by_length:
+                stock_by_length[length] = s
+        available_lengths = sorted(stock_by_length.keys(), reverse=True)
 
-        if not viable_stock:
+        if not available_lengths:
             stock_results.append({
-                "error":           f"No stock long enough for {form_type} | {mat_origin}. Largest part: {max_cut}\". Add a longer stock size to Nesting_Stock_Library.",
-                "form_type":       form_type,
+                "error": f"No viable stock lengths for: {form_type} | {mat_origin}.",
+                "form_type": form_type,
                 "material_origin": mat_origin
             })
             continue
 
-        # Prefer shorter stock first to minimise offcuts
-        viable_stock_sorted = sorted(viable_stock, key=lambda s: float(s["length_in"]))
-        chosen_stock        = viable_stock_sorted[0]
-        stock_length        = float(chosen_stock["length_in"])
+        # Check if longest stock can fit the longest part
+        max_cut = max(c["length_in"] for c in remaining_cuts)
+        max_stock = available_lengths[0]
+        if max_stock < max_cut:
+            stock_results.append({
+                "error": f"No stock long enough for {form_type} | {mat_origin}. Largest part: {max_cut}\", longest stock: {max_stock}\". Add longer stock.",
+                "form_type": form_type,
+                "material_origin": mat_origin
+            })
+            continue
 
-        # --- First Fit Decreasing packing ---
+        # --- Multi-stock best-fit packing ---
         bins = []
-        for cut in cuts_sorted:
-            placed = False
-            for b in bins:
-                if b["remaining"] >= cut["length_in"] + kerf:
-                    b["cuts"].append({
-                        "part_mark":     cut["part_mark"],
-                        "bom_line_id":   cut["bom_line_id"],
-                        "material_type": cut["material_type"],
-                        "spec_name":     cut["spec_name"],
-                        "cut_length":    cut["length_in"],
-                        "kerf":          kerf
-                    })
-                    b["remaining"] -= (cut["length_in"] + kerf)
-                    placed = True
-                    break
-            if not placed:
-                bins.append({
-                    "remaining": stock_length - cut["length_in"] - kerf,
-                    "cuts": [{
-                        "part_mark":     cut["part_mark"],
-                        "bom_line_id":   cut["bom_line_id"],
-                        "material_type": cut["material_type"],
-                        "spec_name":     cut["spec_name"],
-                        "cut_length":    cut["length_in"],
-                        "kerf":          kerf
-                    }]
-                })
 
-        # --- Local swap optimisation ---
-        bins = _optimize_1d_bins(bins, stock_length, kerf)
+        # Process each stock length from longest to shortest
+        for stock_length in available_lengths:
+            if not remaining_cuts:
+                break
+
+            chosen_stock = stock_by_length[stock_length]
+
+            # Keep opening bins at this stock length as long as parts fit
+            while remaining_cuts:
+                # Find parts that fit this stock length
+                fits_any = False
+                for cut in remaining_cuts:
+                    if cut["length_in"] + kerf <= stock_length:
+                        fits_any = True
+                        break
+
+                if not fits_any:
+                    break  # No remaining parts fit this stock length, try shorter
+
+                # Open a new bin at this stock length
+                current_bin = {
+                    "stock_length": stock_length,
+                    "chosen_stock": chosen_stock,
+                    "remaining": stock_length,
+                    "cuts": []
+                }
+
+                # Pack as many parts as possible into this bin (best-fit)
+                # Try each remaining part, largest first
+                still_remaining = []
+                for cut in remaining_cuts:
+                    needed = cut["length_in"] + kerf
+                    if current_bin["remaining"] >= needed:
+                        current_bin["cuts"].append({
+                            "part_mark":     cut["part_mark"],
+                            "bom_line_id":   cut["bom_line_id"],
+                            "material_type": cut["material_type"],
+                            "spec_name":     cut["spec_name"],
+                            "cut_length":    cut["length_in"],
+                            "kerf":          kerf
+                        })
+                        current_bin["remaining"] -= needed
+                    else:
+                        still_remaining.append(cut)
+
+                if current_bin["cuts"]:
+                    bins.append(current_bin)
+
+                remaining_cuts = sorted(still_remaining, key=lambda c: c["length_in"], reverse=True)
+
+        # Handle any parts that couldn't be placed (shouldn't happen if stock is adequate)
+        if remaining_cuts:
+            stock_results.append({
+                "error": f"Could not place {len(remaining_cuts)} cuts for {form_type} | {mat_origin}. Parts may be longer than available stock.",
+                "form_type": form_type,
+                "material_origin": mat_origin
+            })
+
+        # --- Optimization pass: try to consolidate bins ---
+        bins = _optimize_bins(bins, kerf)
+
+        # --- Try to downsize bins to shorter stock where possible ---
+        bins = _downsize_bins(bins, available_lengths, stock_by_length, kerf)
 
         # --- Build result records ---
         for b in bins:
+            stock_length = b["stock_length"]
+            chosen_stock = b["chosen_stock"]
             used_length = stock_length - b["remaining"]
-            waste_pct   = round((b["remaining"] / stock_length) * 100, 2)
-            weight      = _calc_weight_1d(chosen_stock, used_length, density)
+            waste_pct = round((b["remaining"] / stock_length) * 100, 2)
+            weight = _calc_weight_1d(chosen_stock, used_length, density)
 
-            # Group cuts by part_mark + length for cut summary
+            # Group cuts by part_mark + length
             cut_summary = {}
             for c in b["cuts"]:
                 k = (c["part_mark"], c["cut_length"])
@@ -151,7 +176,7 @@ def nest_1d(parts, stock_options, kerf):
                         "material_type":          c["material_type"],
                         "spec_name":              c["spec_name"],
                         "cut_length":             c["cut_length"],
-                        "quantity_on_this_stock": 0,
+                        "quantity_on_this_stock":  0,
                         "cut_sequence":           len(cut_summary) + 1
                     }
                 cut_summary[k]["quantity_on_this_stock"] += 1
@@ -175,35 +200,70 @@ def nest_1d(parts, stock_options, kerf):
     return stock_results
 
 
-def _optimize_1d_bins(bins, stock_length, kerf):
-    """Multi-pass local swap — consolidate cuts to reduce total stock count."""
+def _optimize_bins(bins, kerf):
+    """Try to move cuts from one bin to another to eliminate bins entirely."""
     improved = True
     while improved:
         improved = False
-        for i in range(len(bins)):
-            for j in range(len(bins)):
-                if i == j:
-                    continue
-                for cut in list(bins[i]["cuts"]):
+        # Sort bins by remaining space descending (most empty first — candidates for elimination)
+        bins.sort(key=lambda b: b["remaining"], reverse=True)
+        for i in range(len(bins) - 1, -1, -1):
+            if not bins[i]["cuts"]:
+                continue
+            # Try to move ALL cuts from bin[i] to other bins
+            all_moved = True
+            moves = []
+            for cut in bins[i]["cuts"]:
+                placed = False
+                for j in range(len(bins)):
+                    if i == j:
+                        continue
                     needed = cut["cut_length"] + kerf
                     if bins[j]["remaining"] >= needed:
-                        bins[j]["cuts"].append(cut)
-                        bins[j]["remaining"] -= needed
-                        bins[i]["cuts"].remove(cut)
-                        bins[i]["remaining"] += needed
-                        improved = True
+                        moves.append((cut, j))
+                        placed = True
                         break
+                if not placed:
+                    all_moved = False
+                    break
+
+            if all_moved and moves:
+                # Execute all moves — eliminate bin[i]
+                for cut, target_idx in moves:
+                    bins[target_idx]["cuts"].append(cut)
+                    bins[target_idx]["remaining"] -= (cut["cut_length"] + kerf)
+                bins[i]["cuts"] = []
+                improved = True
+
         bins = [b for b in bins if b["cuts"]]
     return bins
 
 
+def _downsize_bins(bins, available_lengths, stock_by_length, kerf):
+    """After packing, check if any bin can use a shorter stock size."""
+    sorted_lengths = sorted(available_lengths)  # shortest first
+
+    for b in bins:
+        total_needed = sum(c["cut_length"] + kerf for c in b["cuts"])
+        # Find the shortest stock that fits all cuts in this bin
+        for length in sorted_lengths:
+            if length >= total_needed:
+                if length < b["stock_length"]:
+                    b["stock_length"] = length
+                    b["chosen_stock"] = stock_by_length[length]
+                    b["remaining"] = length - total_needed
+                break
+
+    return bins
+
+
 def _calc_weight_1d(stock, used_length_in, density):
-    """Weight using Nominal_Density from Material_Type lookup."""
+    """Weight calculation."""
     if not density or density == 0:
         return 0
-    area_in2  = float(stock.get("area_in2", 0) or 0)
+    area_in2 = float(stock.get("area_in2", 0) or 0)
     thickness = float(stock.get("thickness_in", 0) or 0)
-    width     = float(stock.get("width_in", 0) or 0)
+    width = float(stock.get("width_in", 0) or 0)
     if area_in2 > 0:
         return used_length_in * area_in2 * density
     if thickness > 0 and width > 0:
