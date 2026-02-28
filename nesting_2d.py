@@ -1,28 +1,24 @@
 """
-2D Panel Nesting - Guillotine Cut Algorithm
+2D Panel Nesting - Multi-Stock Guillotine Cut Algorithm
+Algorithm:
+  1. Sort all available panel stock sizes DESCENDING by area (largest first)
+  2. Sort all parts DESCENDING by area (largest first)
+  3. For the largest stock panel, pack as many parts as possible (guillotine)
+  4. Once a panel is full, open a new panel at the same size
+  5. When no more parts fit the current panel size, step down to next smaller
+  6. After packing, downsize each panel to the smallest stock that fits its cuts
+
 Stock matching: form_type + material_origin
-  - material_origin: e.g. "Carbon Steel", "Aluminum", "Stainless Steel"
-    (from Specification.Material_Type_Origin — fully data-driven)
 """
 
 
 def nest_2d(parts, stock_options, kerf):
     """
-    parts: list of dicts:
-        {
-            "part_mark":       "P1",
-            "bom_line_id":     "12345",
-            "form_type":       "Flat",
-            "material_type":   "Plate",        # display only
-            "material_origin": "Carbon Steel", # used for stock matching
-            "spec_name":       "A36",          # display only
-            "density":         0.2833,
-            "length_in":       24.0,
-            "width_in":        12.0,
-            "thickness_in":    0.25,
-            "quantity":        3,
-            "grain_direction": "none"
-        }
+    parts: list of dicts with part_mark, bom_line_id, form_type, material_type,
+           material_origin, spec_name, density, length_in, width_in, thickness_in,
+           quantity, grain_direction
+    stock_options: list of dicts with stock_id, stock_label, form_type,
+                   material_origin, density, length_in, width_in, is_standard
     """
 
     # Group by form_type + material_origin + thickness
@@ -33,12 +29,12 @@ def nest_2d(parts, stock_options, kerf):
             groups[key] = {"parts": [], "density": part.get("density", 0)}
         for _ in range(int(part["quantity"])):
             groups[key]["parts"].append({
-                "part_mark":      part["part_mark"],
-                "bom_line_id":    part["bom_line_id"],
-                "material_type":  part.get("material_type", ""),
-                "spec_name":      part.get("spec_name", ""),
-                "length_in":      float(part["length_in"]),
-                "width_in":       float(part["width_in"]),
+                "part_mark":       part["part_mark"],
+                "bom_line_id":     part["bom_line_id"],
+                "material_type":   part.get("material_type", ""),
+                "spec_name":       part.get("spec_name", ""),
+                "length_in":       float(part["length_in"]),
+                "width_in":        float(part["width_in"]),
                 "grain_direction": part.get("grain_direction", "none").lower()
             })
 
@@ -47,104 +43,139 @@ def nest_2d(parts, stock_options, kerf):
 
     for (form_type, mat_origin, thickness), group_data in groups.items():
         parts_group = group_data["parts"]
-        density     = group_data["density"]
+        density = group_data["density"]
 
-        # Match stock by form_type + material_origin + thickness
+        # Match stock by form_type + material_origin
         matching_stock = [
             s for s in stock_options
             if s["form_type"].strip().lower() == form_type.strip().lower()
             and s["material_origin"].strip().lower() == mat_origin.strip().lower()
-            and abs(float(s.get("thickness_in", 0)) - thickness) < 0.001
         ]
-
-        # Fallback: match without thickness
-        if not matching_stock:
-            matching_stock = [
-                s for s in stock_options
-                if s["form_type"].strip().lower() == form_type.strip().lower()
-                and s["material_origin"].strip().lower() == mat_origin.strip().lower()
-            ]
 
         if not matching_stock:
             stock_results.append({
-                "error":           f"No panel stock found for {form_type} | {mat_origin} | {thickness}\" thk. Add to Nesting_Stock_Library.",
-                "form_type":       form_type,
+                "error": f"No panel stock found for {form_type} | {mat_origin} | {thickness}\" thk. Add to Nesting_Stock_Library.",
+                "form_type": form_type,
                 "material_origin": mat_origin
             })
             continue
 
-        # Sort largest area first
-        parts_sorted = sorted(
+        # Sort parts by area descending (largest first)
+        remaining_parts = sorted(
             parts_group,
             key=lambda p: p["length_in"] * p["width_in"],
             reverse=True
         )
 
-        max_l = max(p["length_in"] for p in parts_sorted)
-        max_w = max(p["width_in"] for p in parts_sorted)
+        # Get unique stock sizes sorted by area DESCENDING (largest first)
+        stock_by_key = {}
+        for s in matching_stock:
+            sl = float(s["length_in"])
+            sw = float(s["width_in"])
+            size_key = (sl, sw)
+            if size_key not in stock_by_key:
+                stock_by_key[size_key] = s
+        available_sizes = sorted(stock_by_key.keys(), key=lambda k: k[0] * k[1], reverse=True)
 
-        viable_stock = [
-            s for s in matching_stock
-            if float(s["length_in"]) >= max_l and float(s["width_in"]) >= max_w
-        ]
-        if not viable_stock:
-            viable_stock = [
-                s for s in matching_stock
-                if float(s["length_in"]) >= max_w and float(s["width_in"]) >= max_l
-            ]
-
-        if not viable_stock:
+        if not available_sizes:
             stock_results.append({
-                "error":           f"No panel large enough for {form_type} | {mat_origin} — largest part {max_l}×{max_w}\". Add larger stock to Nesting_Stock_Library.",
-                "form_type":       form_type,
+                "error": f"No viable panel stock for: {form_type} | {mat_origin}.",
+                "form_type": form_type,
                 "material_origin": mat_origin
             })
             continue
 
-        viable_stock_sorted = sorted(
-            viable_stock,
-            key=lambda s: float(s["length_in"]) * float(s["width_in"])
+        # Check if largest stock can fit the largest part
+        max_part_l = max(p["length_in"] for p in remaining_parts)
+        max_part_w = max(p["width_in"] for p in remaining_parts)
+        largest_stock = available_sizes[0]
+        can_fit = (
+            (largest_stock[0] >= max_part_l and largest_stock[1] >= max_part_w) or
+            (largest_stock[0] >= max_part_w and largest_stock[1] >= max_part_l)
         )
-        chosen_stock = viable_stock_sorted[0]
-        stock_l      = float(chosen_stock["length_in"])
-        stock_w      = float(chosen_stock["width_in"])
+        if not can_fit:
+            stock_results.append({
+                "error": f"No panel large enough for {form_type} | {mat_origin} — largest part {max_part_l}×{max_part_w}\". Add larger stock.",
+                "form_type": form_type,
+                "material_origin": mat_origin
+            })
+            continue
 
-        # --- Guillotine packing ---
+        # --- Multi-stock guillotine packing ---
         sheets = []
-        for part in parts_sorted:
-            placed = False
-            for sheet in sheets:
-                result = _guillotine_place(sheet["free_rects"], part, kerf)
-                if result:
-                    x, y, rotated = result
-                    sheet["cuts"].append(_make_cut(part, x, y, rotated))
-                    placed = True
-                    break
-            if not placed:
-                new_sheet = {
+
+        for (stock_l, stock_w) in available_sizes:
+            if not remaining_parts:
+                break
+
+            chosen_stock = stock_by_key[(stock_l, stock_w)]
+
+            while remaining_parts:
+                # Check if any remaining part fits this stock size
+                fits_any = False
+                for part in remaining_parts:
+                    if _part_fits_stock(part, stock_l, stock_w, kerf):
+                        fits_any = True
+                        break
+                if not fits_any:
+                    break  # No remaining parts fit this stock, try smaller
+
+                # Open a new sheet at this stock size
+                current_sheet = {
+                    "stock_l": stock_l,
+                    "stock_w": stock_w,
+                    "chosen_stock": chosen_stock,
                     "free_rects": [{"x": 0, "y": 0, "l": stock_l, "w": stock_w}],
                     "cuts": []
                 }
-                result = _guillotine_place(new_sheet["free_rects"], part, kerf)
-                if result:
-                    x, y, rotated = result
-                    new_sheet["cuts"].append(_make_cut(part, x, y, rotated))
-                    sheets.append(new_sheet)
+
+                # Pack as many parts as possible into this sheet
+                still_remaining = []
+                for part in remaining_parts:
+                    result = _guillotine_place(current_sheet["free_rects"], part, kerf)
+                    if result:
+                        x, y, rotated = result
+                        current_sheet["cuts"].append(_make_cut(part, x, y, rotated))
+                    else:
+                        still_remaining.append(part)
+
+                if current_sheet["cuts"]:
+                    sheets.append(current_sheet)
+
+                remaining_parts = sorted(
+                    still_remaining,
+                    key=lambda p: p["length_in"] * p["width_in"],
+                    reverse=True
+                )
+
+        # Handle unplaced parts
+        if remaining_parts:
+            stock_results.append({
+                "error": f"Could not place {len(remaining_parts)} panels for {form_type} | {mat_origin}. Parts may be larger than available stock.",
+                "form_type": form_type,
+                "material_origin": mat_origin
+            })
+
+        # --- Downsize sheets to smallest viable stock ---
+        sheets = _downsize_sheets(sheets, available_sizes, stock_by_key, kerf)
 
         # --- Build result records ---
         for sheet in sheets:
-            used_area   = sum(c["cut_length"] * c["cut_width"] for c in sheet["cuts"])
-            total_area  = stock_l * stock_w
+            stock_l = sheet["stock_l"]
+            stock_w = sheet["stock_w"]
+            chosen_stock = sheet["chosen_stock"]
+            used_area = sum(c["cut_length"] * c["cut_width"] for c in sheet["cuts"])
+            total_area = stock_l * stock_w
             remnant_area = total_area - used_area
-            waste_pct   = round((remnant_area / total_area) * 100, 2)
+            waste_pct = round((remnant_area / total_area) * 100, 2)
 
-            max_x     = max((c["x_position"] + c["cut_length"]) for c in sheet["cuts"]) if sheet["cuts"] else 0
-            max_y     = max((c["y_position"] + c["cut_width"])  for c in sheet["cuts"]) if sheet["cuts"] else 0
+            max_x = max((c["x_position"] + c["cut_length"]) for c in sheet["cuts"]) if sheet["cuts"] else 0
+            max_y = max((c["y_position"] + c["cut_width"]) for c in sheet["cuts"]) if sheet["cuts"] else 0
             remnant_l = round(stock_l - max_x, 4)
             remnant_w = round(stock_w - max_y, 4)
 
             weight = _calc_weight_2d(density, used_area, thickness)
-            svg    = _generate_svg(sheet["cuts"], stock_l, stock_w, kerf)
+            svg = _generate_svg(sheet["cuts"], stock_l, stock_w, kerf)
 
             cut_summary = {}
             for c in sheet["cuts"]:
@@ -176,35 +207,73 @@ def nest_2d(parts, stock_options, kerf):
     return stock_results
 
 
+def _part_fits_stock(part, stock_l, stock_w, kerf):
+    """Check if a part can fit on a stock panel (with or without rotation)."""
+    pl, pw = part["length_in"], part["width_in"]
+    grain = part.get("grain_direction", "none")
+    if stock_l >= pl + kerf and stock_w >= pw + kerf:
+        return True
+    if grain == "none":
+        if stock_l >= pw + kerf and stock_w >= pl + kerf:
+            return True
+    return False
+
+
+def _downsize_sheets(sheets, available_sizes, stock_by_key, kerf):
+    """After packing, check if any sheet can use a smaller stock panel."""
+    sorted_sizes = sorted(available_sizes, key=lambda k: k[0] * k[1])  # smallest first
+
+    for sheet in sheets:
+        # Find the bounding box of all placed cuts
+        if not sheet["cuts"]:
+            continue
+        max_x = max(c["x_position"] + c["cut_length"] + kerf for c in sheet["cuts"])
+        max_y = max(c["y_position"] + c["cut_width"] + kerf for c in sheet["cuts"])
+
+        # Find smallest stock that fits the bounding box
+        for (sl, sw) in sorted_sizes:
+            if sl >= max_x and sw >= max_y:
+                if sl * sw < sheet["stock_l"] * sheet["stock_w"]:
+                    sheet["stock_l"] = sl
+                    sheet["stock_w"] = sw
+                    sheet["chosen_stock"] = stock_by_key[(sl, sw)]
+                break
+
+    return sheets
+
+
 def _make_cut(part, x, y, rotated):
     return {
-        "part_mark":             part["part_mark"],
-        "bom_line_id":           part["bom_line_id"],
-        "material_type":         part.get("material_type", ""),
-        "spec_name":             part.get("spec_name", ""),
-        "cut_length":            part["length_in"],
-        "cut_width":             part["width_in"],
-        "x_position":            round(x, 4),
-        "y_position":            round(y, 4),
-        "rotation":              "90°" if rotated else "0°",
-        "quantity_on_this_stock": 1
+        "part_mark":              part["part_mark"],
+        "bom_line_id":            part["bom_line_id"],
+        "material_type":          part.get("material_type", ""),
+        "spec_name":              part.get("spec_name", ""),
+        "cut_length":             part["length_in"],
+        "cut_width":              part["width_in"],
+        "x_position":             round(x, 4),
+        "y_position":             round(y, 4),
+        "rotation":               "90°" if rotated else "0°",
+        "quantity_on_this_stock":  1
     }
 
 
 def _guillotine_place(free_rects, part, kerf):
+    """Find best free rectangle to place part using guillotine cuts."""
     best = None
     best_area = float("inf")
     part_l = part["length_in"]
     part_w = part["width_in"]
-    grain  = part.get("grain_direction", "none")
+    grain = part.get("grain_direction", "none")
 
     for rect in free_rects:
         rl, rw = rect["l"], rect["w"]
+        # Normal orientation
         if rl >= part_l + kerf and rw >= part_w + kerf:
             area = rl * rw
             if area < best_area:
                 best = (rect, False)
                 best_area = area
+        # Rotated orientation (only if grain allows)
         if grain == "none":
             if rl >= part_w + kerf and rw >= part_l + kerf:
                 area = rl * rw
@@ -220,6 +289,7 @@ def _guillotine_place(free_rects, part, kerf):
     placed_l = part_w if rotated else part_l
     placed_w = part_l if rotated else part_w
 
+    # Split remaining space (guillotine cut)
     free_rects.remove(rect)
     right_l = rect["l"] - placed_l - kerf
     if right_l > kerf:
@@ -240,7 +310,8 @@ def _calc_weight_2d(density, used_area_in2, thickness):
 def _generate_svg(cuts, stock_l, stock_w, kerf, scale=4):
     svg_w = stock_l * scale
     svg_h = stock_w * scale
-    colors = ["#4E9AF1","#F1A04E","#4EF16A","#F14E4E","#A04EF1","#F1E24E","#4EF1E2","#F14EA0","#7EF14E","#F17E4E"]
+    colors = ["#4E9AF1", "#F1A04E", "#4EF16A", "#F14E4E", "#A04EF1",
+              "#F1E24E", "#4EF1E2", "#F14EA0", "#7EF14E", "#F17E4E"]
     part_colors = {}
     color_idx = 0
     rects = []
@@ -259,4 +330,9 @@ def _generate_svg(cuts, stock_l, stock_w, kerf, scale=4):
             f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{color}" stroke="#333" stroke-width="1" opacity="0.85"/>'
             f'<text x="{x+w/2}" y="{y+h/2}" text-anchor="middle" dominant-baseline="middle" font-size="10" fill="#111">{label}</text>'
         )
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_w}" height="{svg_h}" viewBox="0 0 {svg_w} {svg_h}"><rect width="{svg_w}" height="{svg_h}" fill="#e8e8e8" stroke="#999" stroke-width="2"/>{"".join(rects)}</svg>'
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_w}" height="{svg_h}" '
+        f'viewBox="0 0 {svg_w} {svg_h}">'
+        f'<rect width="{svg_w}" height="{svg_h}" fill="#e8e8e8" stroke="#999" stroke-width="2"/>'
+        f'{"".join(rects)}</svg>'
+    )
