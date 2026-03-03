@@ -77,37 +77,26 @@ def nest_2d(parts, stock_options, kerf):
             reverse=True
         )
 
-        # Check each part individually — report errors for any that won't fit
-        unfittable_parts = set()
+        # Check for parts that can't fit any stock — report errors upfront
+        placeable_parts = []
         for part in remaining_parts:
-            can_fit_any = False
-            for (sl, sw) in available_sizes:
-                if _part_fits_stock(part, sl, sw, kerf):
-                    can_fit_any = True
-                    break
-            if not can_fit_any:
-                part_key = (part["part_mark"], part["length_in"], part["width_in"])
-                if part_key not in unfittable_parts:
-                    unfittable_parts.add(part_key)
-                    stock_results.append({
-                        "error": f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}.",
-                        "form_type": form_type,
-                        "material_origin": mat_origin
-                    })
+            if _part_fits_any_stock(part, available_sizes, kerf):
+                placeable_parts.append(part)
+            else:
+                stock_results.append({
+                    "error": f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}.",
+                    "form_type": form_type,
+                    "material_origin": mat_origin
+                })
+        remaining_parts = placeable_parts
 
-        # Remove unfittable parts from remaining
-        fittable_parts = [
-            p for p in remaining_parts
-            if (p["part_mark"], p["length_in"], p["width_in"]) not in unfittable_parts
-        ]
-
-        if not fittable_parts:
+        if not remaining_parts:
             continue
 
         # --- Best-fit packing: for each part, find smallest stock that works ---
         sheets = []
 
-        for part in fittable_parts:
+        for part in remaining_parts:
             # Try to fit into an existing sheet (prefer sheet with least free area)
             placed = False
             best_sheet = None
@@ -137,7 +126,11 @@ def nest_2d(parts, stock_options, kerf):
                         break
 
                 if chosen_size is None:
-                    # Already reported above, skip
+                    stock_results.append({
+                        "error": f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}.",
+                        "form_type": form_type,
+                        "material_origin": mat_origin
+                    })
                     continue
 
                 sl, sw = chosen_size
@@ -208,6 +201,14 @@ def nest_2d(parts, stock_options, kerf):
     return stock_results
 
 
+def _part_fits_any_stock(part, available_sizes, kerf):
+    """Check if a part can fit on ANY available stock panel."""
+    for (sl, sw) in available_sizes:
+        if _part_fits_stock(part, sl, sw, kerf):
+            return True
+    return False
+
+
 def _part_fits_stock(part, stock_l, stock_w, kerf):
     """Check if a part can fit on a stock panel (with or without rotation)."""
     pl, pw = part["length_in"], part["width_in"]
@@ -229,15 +230,13 @@ def _optimize_sheets(sheets, kerf):
         for i in range(len(sheets)):
             if not sheets[i]["cuts"]:
                 continue
-            # Try to move ALL cuts from sheet[i] to other sheets
             moves = []
             all_moved = True
-            # Work on a copy of free_rects for simulation
             for cut_info in sheets[i]["cuts"]:
                 part = {
                     "length_in": cut_info["cut_length"],
                     "width_in": cut_info["cut_width"],
-                    "grain_direction": "none" if cut_info.get("rotation") == "90°" else "length"
+                    "grain_direction": "none" if cut_info.get("rotation") == 90 else "length"
                 }
                 placed = False
                 for j in range(len(sheets)):
@@ -269,76 +268,47 @@ def _optimize_sheets(sheets, kerf):
 def _downsize_sheets(sheets, available_sizes, stock_by_key, kerf):
     """After packing, check if any sheet can use a smaller stock panel.
     
-    Re-packs all cuts on candidate smaller stock to verify they actually fit,
-    rather than just checking bounding box (which can miss guillotine split issues).
+    For each sheet, compute the bounding box of all placed cuts (including kerf),
+    then find the smallest stock panel that fits that bounding box — trying both
+    normal and rotated orientations of each stock size.
     """
     for sheet in sheets:
         if not sheet["cuts"]:
             continue
+        # Find the bounding box of all placed cuts
+        max_x = max(c["x_position"] + c["cut_length"] + kerf for c in sheet["cuts"])
+        max_y = max(c["y_position"] + c["cut_width"] + kerf for c in sheet["cuts"])
 
         current_area = sheet["stock_l"] * sheet["stock_w"]
-
-        # Collect the parts from this sheet's cuts for re-packing validation
-        sheet_parts = []
-        for c in sheet["cuts"]:
-            sheet_parts.append({
-                "length_in": c["cut_length"],
-                "width_in": c["cut_width"],
-                "grain_direction": "none" if c.get("rotation") == "90°" else "length",
-                "part_mark": c["part_mark"],
-                "bom_line_id": c["bom_line_id"],
-                "material_type": c.get("material_type", ""),
-                "spec_name": c.get("spec_name", ""),
-            })
-        # Sort parts largest first for best packing
-        sheet_parts.sort(key=lambda p: p["length_in"] * p["width_in"], reverse=True)
-
-        # Try each available stock size from smallest to largest
         best_size = None
-        best_cuts = None
-        for (sl, sw) in available_sizes:
-            if sl * sw >= current_area:
-                break  # no point trying equal or larger stock
+        best_area = current_area
 
-            # Try normal orientation
-            repacked = _try_repack(sheet_parts, sl, sw, kerf)
-            if repacked is not None:
-                best_size = (sl, sw)
-                best_cuts = repacked
-                break  # smallest that works, take it
+        # Find smallest stock that fits the bounding box
+        for (sl, sw) in available_sizes:  # sorted smallest first by area
+            stock_area = sl * sw
+            if stock_area >= best_area:
+                break  # remaining sizes are all larger, no point checking
 
-            # Try swapped orientation (stock rotated)
-            repacked = _try_repack(sheet_parts, sw, sl, kerf)
-            if repacked is not None:
-                # Use the original (sl, sw) key for stock_by_key lookup
-                best_size = (sl, sw)
-                best_cuts = repacked
-                break
+            # Normal orientation: stock length >= bounding box X, stock width >= bounding box Y
+            if sl >= max_x and sw >= max_y:
+                if stock_area < best_area:
+                    best_size = (sl, sw)
+                    best_area = stock_area
+                continue  # keep checking — there might be an even smaller stock
 
-        if best_size and best_cuts:
+            # Rotated stock orientation: swap stock length/width
+            if sw >= max_x and sl >= max_y:
+                if stock_area < best_area:
+                    best_size = (sl, sw)
+                    best_area = stock_area
+                continue
+
+        if best_size and best_area < current_area:
             sheet["stock_l"] = best_size[0]
             sheet["stock_w"] = best_size[1]
             sheet["chosen_stock"] = stock_by_key[best_size]
-            sheet["cuts"] = best_cuts
-            # Rebuild free_rects (not strictly needed since we're done packing)
-            sheet["free_rects"] = []
 
     return sheets
-
-
-def _try_repack(parts, stock_l, stock_w, kerf):
-    """Try to pack all parts onto a stock panel. Returns new cuts list if successful, None otherwise."""
-    free_rects = [{"x": 0, "y": 0, "l": stock_l, "w": stock_w}]
-    new_cuts = []
-
-    for part in parts:
-        result = _guillotine_place(free_rects, part, kerf, dry_run=False)
-        if result is None:
-            return None  # doesn't fit — this stock size won't work
-        x, y, rotated = result
-        new_cuts.append(_make_cut(part, x, y, rotated))
-
-    return new_cuts
 
 
 def _make_cut(part, x, y, rotated):
@@ -351,7 +321,7 @@ def _make_cut(part, x, y, rotated):
         "cut_width":              part["width_in"],
         "x_position":             round(x, 4),
         "y_position":             round(y, 4),
-        "rotation":               "90°" if rotated else "0°",
+        "rotation":               90 if rotated else 0,
         "quantity_on_this_stock":  1
     }
 
