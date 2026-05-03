@@ -29,6 +29,29 @@ def _stock_matches_material(stock_entry, cut_material_name):
     return _norm_mat(sm) == _norm_mat(cut_material_name)
 
 
+def _consumed_per_stock_id(bins):
+    """Count how many bins currently use each stock_id."""
+    counts = {}
+    for b in bins:
+        sid = b["chosen_stock"].get("stock_id")
+        if sid is not None:
+            counts[sid] = counts.get(sid, 0) + 1
+    return counts
+
+
+def _stock_at_cap(stock_entry, consumed):
+    """True if this stock has a quantity cap and we've already used all of it."""
+    qty = stock_entry.get("quantity")
+    try:
+        qty_int = int(qty) if qty not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        qty_int = None
+    if qty_int is None or qty_int <= 0:
+        return False  # no cap
+    sid = stock_entry.get("stock_id")
+    return consumed.get(sid, 0) >= qty_int
+
+
 def nest_1d(parts, stock_options, kerf):
     # Group parts by form_type + material_origin
     groups = {}
@@ -123,8 +146,12 @@ def nest_1d(parts, stock_options, kerf):
                 })
                 best_bin["remaining"] -= needed
             else:
-                # Open a new bin — only consider stock that matches this cut's material
-                cut_stock = [s for s in matching_stock if _stock_matches_material(s, cut_mat)]
+                # Open a new bin — material-compatible AND under quantity cap
+                consumed = _consumed_per_stock_id(bins)
+                cut_stock = [
+                    s for s in matching_stock
+                    if _stock_matches_material(s, cut_mat) and not _stock_at_cap(s, consumed)
+                ]
                 chosen_stock = None
                 for s in sorted(cut_stock, key=lambda x: float(x["length_in"])):
                     if float(s["length_in"]) >= needed:
@@ -132,7 +159,15 @@ def nest_1d(parts, stock_options, kerf):
                         break
 
                 if chosen_stock is None:
-                    err = f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}"
+                    # Distinguish "no compatible stock" from "all compatible stock at qty cap"
+                    any_compatible = [
+                        s for s in matching_stock
+                        if _stock_matches_material(s, cut_mat) and float(s["length_in"]) >= needed
+                    ]
+                    if any_compatible:
+                        err = f"Part {cut['part_mark']} ({cut_len}\") cannot be nested — all available stock at quantity cap"
+                    else:
+                        err = f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}"
                     if cut_mat:
                         err += f" matching material '{cut_mat}'"
                     stock_results.append({
@@ -255,15 +290,24 @@ def _optimize_bins(bins, kerf):
 
 
 def _downsize_bins(bins, matching_stock, kerf):
-    """Shrink each bin to the shortest stock that fits all its cuts —
-    only considering stock entries whose material_name is compatible with
-    the bin's existing material constraint."""
+    """Shrink each bin to the shortest stock that fits all its cuts.
+    Respects material_name compatibility AND quantity cap on candidate stock."""
     for b in bins:
         total_needed = sum(c["cut_length"] + kerf for c in b["cuts"])
         bin_mat = b["chosen_stock"].get("material_name", "")
-        # Compatible candidates: same material constraint as the bin's current stock
+        cur_sid = b["chosen_stock"].get("stock_id")
+
+        # Treat this bin's current stock as freed when checking caps for candidates
+        # (we'd be releasing one usage of cur_sid by downsizing).
+        consumed = _consumed_per_stock_id(bins)
+        if cur_sid is not None and consumed.get(cur_sid, 0) > 0:
+            consumed = {**consumed, cur_sid: consumed[cur_sid] - 1}
+
+        # Compatible candidates: same material constraint, not at cap
         candidates = sorted(
-            [s for s in matching_stock if (s.get("material_name", "") or "") == (bin_mat or "")],
+            [s for s in matching_stock
+             if (s.get("material_name", "") or "") == (bin_mat or "")
+             and not _stock_at_cap(s, consumed)],
             key=lambda x: float(x["length_in"])
         )
         for s in candidates:

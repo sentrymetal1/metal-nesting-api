@@ -28,6 +28,29 @@ def _stock_matches_material(stock_entry, part_material_name):
     return _norm_mat(sm) == _norm_mat(part_material_name)
 
 
+def _consumed_per_stock_id(sheets):
+    """Count how many sheets currently use each stock_id."""
+    counts = {}
+    for s in sheets:
+        sid = s["chosen_stock"].get("stock_id")
+        if sid is not None:
+            counts[sid] = counts.get(sid, 0) + 1
+    return counts
+
+
+def _stock_at_cap(stock_entry, consumed):
+    """True if this stock has a quantity cap and we've already used all of it."""
+    qty = stock_entry.get("quantity")
+    try:
+        qty_int = int(qty) if qty not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        qty_int = None
+    if qty_int is None or qty_int <= 0:
+        return False
+    sid = stock_entry.get("stock_id")
+    return consumed.get(sid, 0) >= qty_int
+
+
 def nest_2d(parts, stock_options, kerf):
     # Group by form_type + material_origin + thickness
     groups = {}
@@ -138,9 +161,12 @@ def nest_2d(parts, stock_options, kerf):
                     placed = True
 
             if not placed:
-                # Open a new sheet — only material-compatible stock
-                compatible_stock = [s for s in matching_stock if _stock_matches_material(s, part_mat)]
-                # Sort smallest area first
+                # Open a new sheet — material-compatible AND under quantity cap
+                consumed = _consumed_per_stock_id(sheets)
+                compatible_stock = [
+                    s for s in matching_stock
+                    if _stock_matches_material(s, part_mat) and not _stock_at_cap(s, consumed)
+                ]
                 compatible_sorted = sorted(
                     compatible_stock,
                     key=lambda s: float(s["length_in"]) * float(s["width_in"])
@@ -153,7 +179,16 @@ def nest_2d(parts, stock_options, kerf):
                         break
 
                 if chosen_stock is None:
-                    err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}"
+                    # Distinguish "no compatible stock" from "all compatible stock at qty cap"
+                    any_compatible_size = [
+                        s for s in matching_stock
+                        if _stock_matches_material(s, part_mat)
+                        and _part_fits_stock(part, float(s["length_in"]), float(s["width_in"]), kerf)
+                    ]
+                    if any_compatible_size:
+                        err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") cannot be nested — all available stock at quantity cap"
+                    else:
+                        err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}"
                     if part_mat:
                         err += f" matching material '{part_mat}'"
                     stock_results.append({
@@ -305,8 +340,9 @@ def _optimize_sheets(sheets, kerf):
 def _downsize_sheets(sheets, matching_stock, kerf):
     """After packing, check if any sheet can use a smaller stock panel.
 
-    Material-aware: only considers stock whose material_name constraint
-    matches the sheet's existing chosen_stock material constraint."""
+    Material-aware AND quantity-cap-aware: only considers stock whose
+    material_name constraint matches the sheet's existing chosen_stock
+    constraint and that is not already at its quantity cap."""
     for sheet in sheets:
         if not sheet["cuts"]:
             continue
@@ -318,10 +354,19 @@ def _downsize_sheets(sheets, matching_stock, kerf):
         best_stock = None
         best_area = current_area
 
-        # Compatible candidates: same material constraint as the sheet's current stock
+        # Same-material candidates only
         sheet_mat = sheet["chosen_stock"].get("material_name", "")
+        cur_sid = sheet["chosen_stock"].get("stock_id")
+
+        # Treat this sheet's current stock as freed when computing caps for candidates
+        consumed = _consumed_per_stock_id(sheets)
+        if cur_sid is not None and consumed.get(cur_sid, 0) > 0:
+            consumed = {**consumed, cur_sid: consumed[cur_sid] - 1}
+
         candidates = sorted(
-            [s for s in matching_stock if (s.get("material_name", "") or "") == (sheet_mat or "")],
+            [s for s in matching_stock
+             if (s.get("material_name", "") or "") == (sheet_mat or "")
+             and not _stock_at_cap(s, consumed)],
             key=lambda s: float(s["length_in"]) * float(s["width_in"])
         )
 
