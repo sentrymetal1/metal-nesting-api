@@ -51,6 +51,14 @@ def _stock_at_cap(stock_entry, consumed):
     return consumed.get(sid, 0) >= qty_int
 
 
+def _stock_is_tagged_for(stock_entry, part_material_name):
+    """True if this stock has a material_name filter that matches the part."""
+    sm = stock_entry.get("material_name", "")
+    if not sm or not part_material_name:
+        return False
+    return _norm_mat(sm) == _norm_mat(part_material_name)
+
+
 def nest_2d(parts, stock_options, kerf):
     # Group by form_type + material_origin + thickness
     groups = {}
@@ -136,18 +144,21 @@ def nest_2d(parts, stock_options, kerf):
         # --- Best-fit packing: for each part, find smallest stock that works ---
         sheets = []
 
-        for part in remaining_parts:
+        def _try_place_2d(part, tagged_only):
+            """Try to place a part into an existing sheet or open a new one.
+            If tagged_only=True, restrict to stock/sheets specifically tagged for
+            this part's material_name. Returns True if placed."""
             part_mat = part.get("material_name", "")
-            # Try to fit into an existing material-compatible sheet
-            placed = False
+
+            # Existing sheet fit
             best_sheet = None
             best_free_area = float("inf")
-
             for sheet in sheets:
                 if not _stock_matches_material(sheet["chosen_stock"], part_mat):
                     continue
-                result = _guillotine_place(sheet["free_rects"], part, kerf, dry_run=True)
-                if result:
+                if tagged_only and not _stock_is_tagged_for(sheet["chosen_stock"], part_mat):
+                    continue
+                if _guillotine_place(sheet["free_rects"], part, kerf, dry_run=True):
                     free_area = sum(r["l"] * r["w"] for r in sheet["free_rects"])
                     if free_area < best_free_area:
                         best_sheet = sheet
@@ -158,59 +169,72 @@ def nest_2d(parts, stock_options, kerf):
                 if result:
                     x, y, rotated = result
                     best_sheet["cuts"].append(_make_cut(part, x, y, rotated))
-                    placed = True
+                    return True
+
+            # Open a new sheet
+            consumed = _consumed_per_stock_id(sheets)
+            compatible_stock = [
+                s for s in matching_stock
+                if _stock_matches_material(s, part_mat) and not _stock_at_cap(s, consumed)
+                and (not tagged_only or _stock_is_tagged_for(s, part_mat))
+            ]
+            compatible_sorted = sorted(
+                compatible_stock,
+                key=lambda s: float(s["length_in"]) * float(s["width_in"])
+            )
+            chosen_stock = None
+            for s in compatible_sorted:
+                sl, sw = float(s["length_in"]), float(s["width_in"])
+                if _part_fits_stock(part, sl, sw, kerf):
+                    chosen_stock = s
+                    break
+            if chosen_stock is None:
+                return False
+
+            sl, sw = float(chosen_stock["length_in"]), float(chosen_stock["width_in"])
+            new_sheet = {
+                "stock_l": sl,
+                "stock_w": sw,
+                "chosen_stock": chosen_stock,
+                "free_rects": [{"x": 0, "y": 0, "l": sl, "w": sw}],
+                "cuts": []
+            }
+            result = _guillotine_place(new_sheet["free_rects"], part, kerf, dry_run=False)
+            if result:
+                x, y, rotated = result
+                new_sheet["cuts"].append(_make_cut(part, x, y, rotated))
+                sheets.append(new_sheet)
+                return True
+            return False
+
+        for part in remaining_parts:
+            part_mat = part.get("material_name", "")
+            # Tagged-first: prefer stock specifically tagged for this material
+            has_tagged = any(_stock_is_tagged_for(s, part_mat) for s in matching_stock)
+            placed = False
+            if has_tagged:
+                placed = _try_place_2d(part, tagged_only=True)
+            if not placed:
+                placed = _try_place_2d(part, tagged_only=False)
 
             if not placed:
-                # Open a new sheet — material-compatible AND under quantity cap
-                consumed = _consumed_per_stock_id(sheets)
-                compatible_stock = [
+                any_compatible_size = [
                     s for s in matching_stock
-                    if _stock_matches_material(s, part_mat) and not _stock_at_cap(s, consumed)
+                    if _stock_matches_material(s, part_mat)
+                    and _part_fits_stock(part, float(s["length_in"]), float(s["width_in"]), kerf)
                 ]
-                compatible_sorted = sorted(
-                    compatible_stock,
-                    key=lambda s: float(s["length_in"]) * float(s["width_in"])
-                )
-                chosen_stock = None
-                for s in compatible_sorted:
-                    sl, sw = float(s["length_in"]), float(s["width_in"])
-                    if _part_fits_stock(part, sl, sw, kerf):
-                        chosen_stock = s
-                        break
-
-                if chosen_stock is None:
-                    # Distinguish "no compatible stock" from "all compatible stock at qty cap"
-                    any_compatible_size = [
-                        s for s in matching_stock
-                        if _stock_matches_material(s, part_mat)
-                        and _part_fits_stock(part, float(s["length_in"]), float(s["width_in"]), kerf)
-                    ]
-                    if any_compatible_size:
-                        err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") cannot be nested — all available stock at quantity cap"
-                    else:
-                        err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}"
-                    if part_mat:
-                        err += f" matching material '{part_mat}'"
-                    stock_results.append({
-                        "error": err + ".",
-                        "form_type": form_type,
-                        "material_origin": mat_origin
-                    })
-                    continue
-
-                sl, sw = float(chosen_stock["length_in"]), float(chosen_stock["width_in"])
-                new_sheet = {
-                    "stock_l": sl,
-                    "stock_w": sw,
-                    "chosen_stock": chosen_stock,
-                    "free_rects": [{"x": 0, "y": 0, "l": sl, "w": sw}],
-                    "cuts": []
-                }
-                result = _guillotine_place(new_sheet["free_rects"], part, kerf, dry_run=False)
-                if result:
-                    x, y, rotated = result
-                    new_sheet["cuts"].append(_make_cut(part, x, y, rotated))
-                    sheets.append(new_sheet)
+                if any_compatible_size:
+                    err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") cannot be nested — all available stock at quantity cap"
+                else:
+                    err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}"
+                if part_mat:
+                    err += f" matching material '{part_mat}'"
+                stock_results.append({
+                    "error": err + ".",
+                    "form_type": form_type,
+                    "material_origin": mat_origin
+                })
+                continue
 
         # --- Optimization: try to consolidate sheets ---
         sheets = _optimize_sheets(sheets, kerf)

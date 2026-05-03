@@ -52,6 +52,15 @@ def _stock_at_cap(stock_entry, consumed):
     return consumed.get(sid, 0) >= qty_int
 
 
+def _stock_is_tagged_for(stock_entry, cut_material_name):
+    """True if this stock has a material_name filter that matches the cut.
+    (Used to prefer tagged stock over generic when both are eligible.)"""
+    sm = stock_entry.get("material_name", "")
+    if not sm or not cut_material_name:
+        return False
+    return _norm_mat(sm) == _norm_mat(cut_material_name)
+
+
 def nest_1d(parts, stock_options, kerf):
     # Group parts by form_type + material_origin
     groups = {}
@@ -119,80 +128,97 @@ def nest_1d(parts, stock_options, kerf):
         # --- Best-fit packing: for each part, find shortest stock that works ---
         bins = []
 
-        for cut in remaining_cuts:
-            cut_len = cut["length_in"]
-            cut_mat = cut.get("material_name", "")
-            needed = cut_len + kerf
+        def _new_cut_record(cut):
+            return {
+                "part_mark":     cut["part_mark"],
+                "bom_line_id":   cut["bom_line_id"],
+                "material_type": cut["material_type"],
+                "material_name": cut.get("material_name", ""),
+                "spec_name":     cut["spec_name"],
+                "cut_length":    cut["length_in"],
+                "kerf":          kerf
+            }
 
-            # Try to fit into an existing bin — must be material-compatible
+        def _try_place(cut, needed, tagged_only):
+            """Try to place a cut into an existing bin or open a new one.
+            If tagged_only=True, only consider stock/bins specifically tagged for
+            this cut's material_name (skip generic). Returns True if placed."""
+            cut_mat = cut.get("material_name", "")
+
+            # Existing bin fit
             best_bin = None
             best_remaining = float("inf")
             for b in bins:
                 if not _stock_matches_material(b["chosen_stock"], cut_mat):
+                    continue
+                if tagged_only and not _stock_is_tagged_for(b["chosen_stock"], cut_mat):
                     continue
                 if b["remaining"] >= needed and b["remaining"] - needed < best_remaining:
                     best_bin = b
                     best_remaining = b["remaining"] - needed
 
             if best_bin:
-                best_bin["cuts"].append({
-                    "part_mark":     cut["part_mark"],
-                    "bom_line_id":   cut["bom_line_id"],
-                    "material_type": cut["material_type"],
-                    "material_name": cut.get("material_name", ""),
-                    "spec_name":     cut["spec_name"],
-                    "cut_length":    cut["length_in"],
-                    "kerf":          kerf
-                })
+                best_bin["cuts"].append(_new_cut_record(cut))
                 best_bin["remaining"] -= needed
-            else:
-                # Open a new bin — material-compatible AND under quantity cap
-                consumed = _consumed_per_stock_id(bins)
-                cut_stock = [
+                return True
+
+            # Open a new bin
+            consumed = _consumed_per_stock_id(bins)
+            candidate_stock = [
+                s for s in matching_stock
+                if _stock_matches_material(s, cut_mat) and not _stock_at_cap(s, consumed)
+                and (not tagged_only or _stock_is_tagged_for(s, cut_mat))
+            ]
+            chosen_stock = None
+            for s in sorted(candidate_stock, key=lambda x: float(x["length_in"])):
+                if float(s["length_in"]) >= needed:
+                    chosen_stock = s
+                    break
+            if chosen_stock is None:
+                return False
+
+            chosen_length = float(chosen_stock["length_in"])
+            bins.append({
+                "stock_length": chosen_length,
+                "chosen_stock": chosen_stock,
+                "remaining":    chosen_length - needed,
+                "cuts":         [_new_cut_record(cut)]
+            })
+            return True
+
+        for cut in remaining_cuts:
+            cut_len = cut["length_in"]
+            cut_mat = cut.get("material_name", "")
+            needed = cut_len + kerf
+
+            # Tagged-first: if any stock is specifically tagged for this material,
+            # try that path before falling back to generic stock. This ensures the
+            # user's targeted custom stock actually gets used for matching parts.
+            has_tagged = any(_stock_is_tagged_for(s, cut_mat) for s in matching_stock)
+            placed = False
+            if has_tagged:
+                placed = _try_place(cut, needed, tagged_only=True)
+            if not placed:
+                placed = _try_place(cut, needed, tagged_only=False)
+
+            if not placed:
+                # Distinguish "no compatible stock" from "all compatible stock at qty cap"
+                any_compatible = [
                     s for s in matching_stock
-                    if _stock_matches_material(s, cut_mat) and not _stock_at_cap(s, consumed)
+                    if _stock_matches_material(s, cut_mat) and float(s["length_in"]) >= needed
                 ]
-                chosen_stock = None
-                for s in sorted(cut_stock, key=lambda x: float(x["length_in"])):
-                    if float(s["length_in"]) >= needed:
-                        chosen_stock = s
-                        break
-
-                if chosen_stock is None:
-                    # Distinguish "no compatible stock" from "all compatible stock at qty cap"
-                    any_compatible = [
-                        s for s in matching_stock
-                        if _stock_matches_material(s, cut_mat) and float(s["length_in"]) >= needed
-                    ]
-                    if any_compatible:
-                        err = f"Part {cut['part_mark']} ({cut_len}\") cannot be nested — all available stock at quantity cap"
-                    else:
-                        err = f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}"
-                    if cut_mat:
-                        err += f" matching material '{cut_mat}'"
-                    stock_results.append({
-                        "error": err + ".",
-                        "form_type": form_type,
-                        "material_origin": mat_origin
-                    })
-                    continue
-
-                chosen_length = float(chosen_stock["length_in"])
-                new_bin = {
-                    "stock_length": chosen_length,
-                    "chosen_stock": chosen_stock,
-                    "remaining": chosen_length - needed,
-                    "cuts": [{
-                        "part_mark":     cut["part_mark"],
-                        "bom_line_id":   cut["bom_line_id"],
-                        "material_type": cut["material_type"],
-                        "material_name": cut.get("material_name", ""),
-                        "spec_name":     cut["spec_name"],
-                        "cut_length":    cut["length_in"],
-                        "kerf":          kerf
-                    }]
-                }
-                bins.append(new_bin)
+                if any_compatible:
+                    err = f"Part {cut['part_mark']} ({cut_len}\") cannot be nested — all available stock at quantity cap"
+                else:
+                    err = f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}"
+                if cut_mat:
+                    err += f" matching material '{cut_mat}'"
+                stock_results.append({
+                    "error": err + ".",
+                    "form_type": form_type,
+                    "material_origin": mat_origin
+                })
+                continue
 
         # --- Optimization: try to consolidate bins ---
         bins = _optimize_bins(bins, kerf)
