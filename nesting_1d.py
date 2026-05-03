@@ -8,8 +8,25 @@ Algorithm:
   5. Pack as many additional parts as possible into each bin
   6. After all packing, downsize any bin that could use shorter stock
 
-Stock matching: form_type + material_origin
+Stock matching: form_type + material_origin, plus optional material_name
+filter — when a stock entry has material_name set, it only matches parts
+with the same material_name (normalized). Blank = generic.
 """
+
+
+def _norm_mat(s):
+    """Normalize material description for comparison: lowercase, strip all whitespace.
+    'L5 x 3 x 1/4' and 'L5x3x1/4' both become 'l5x3x1/4'."""
+    return "".join((s or "").lower().split())
+
+
+def _stock_matches_material(stock_entry, cut_material_name):
+    """A stock entry matches a cut if the stock has no material_name filter,
+    or its (normalized) material_name equals the cut's (normalized) material_name."""
+    sm = stock_entry.get("material_name", "")
+    if not sm:
+        return True
+    return _norm_mat(sm) == _norm_mat(cut_material_name)
 
 
 def nest_1d(parts, stock_options, kerf):
@@ -27,6 +44,7 @@ def nest_1d(parts, stock_options, kerf):
                 "part_mark":     part["part_mark"],
                 "bom_line_id":   part["bom_line_id"],
                 "material_type": part.get("material_type", ""),
+                "material_name": part.get("material_name", ""),
                 "spec_name":     part.get("spec_name", ""),
                 "length_in":     float(part["length_in"])
             })
@@ -80,12 +98,15 @@ def nest_1d(parts, stock_options, kerf):
 
         for cut in remaining_cuts:
             cut_len = cut["length_in"]
+            cut_mat = cut.get("material_name", "")
             needed = cut_len + kerf
 
-            # Try to fit into an existing bin (prefer bin with least remaining space that still fits)
+            # Try to fit into an existing bin — must be material-compatible
             best_bin = None
             best_remaining = float("inf")
             for b in bins:
+                if not _stock_matches_material(b["chosen_stock"], cut_mat):
+                    continue
                 if b["remaining"] >= needed and b["remaining"] - needed < best_remaining:
                     best_bin = b
                     best_remaining = b["remaining"] - needed
@@ -95,35 +116,42 @@ def nest_1d(parts, stock_options, kerf):
                     "part_mark":     cut["part_mark"],
                     "bom_line_id":   cut["bom_line_id"],
                     "material_type": cut["material_type"],
+                    "material_name": cut.get("material_name", ""),
                     "spec_name":     cut["spec_name"],
                     "cut_length":    cut["length_in"],
                     "kerf":          kerf
                 })
                 best_bin["remaining"] -= needed
             else:
-                # Open a new bin — find shortest stock that fits this part
-                chosen_length = None
-                for sl in available_lengths:
-                    if sl >= needed:
-                        chosen_length = sl
+                # Open a new bin — only consider stock that matches this cut's material
+                cut_stock = [s for s in matching_stock if _stock_matches_material(s, cut_mat)]
+                chosen_stock = None
+                for s in sorted(cut_stock, key=lambda x: float(x["length_in"])):
+                    if float(s["length_in"]) >= needed:
+                        chosen_stock = s
                         break
 
-                if chosen_length is None:
+                if chosen_stock is None:
+                    err = f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}"
+                    if cut_mat:
+                        err += f" matching material '{cut_mat}'"
                     stock_results.append({
-                        "error": f"Part {cut['part_mark']} ({cut_len}\") too long for any stock in {form_type} | {mat_origin}.",
+                        "error": err + ".",
                         "form_type": form_type,
                         "material_origin": mat_origin
                     })
                     continue
 
+                chosen_length = float(chosen_stock["length_in"])
                 new_bin = {
                     "stock_length": chosen_length,
-                    "chosen_stock": stock_by_length[chosen_length],
+                    "chosen_stock": chosen_stock,
                     "remaining": chosen_length - needed,
                     "cuts": [{
                         "part_mark":     cut["part_mark"],
                         "bom_line_id":   cut["bom_line_id"],
                         "material_type": cut["material_type"],
+                        "material_name": cut.get("material_name", ""),
                         "spec_name":     cut["spec_name"],
                         "cut_length":    cut["length_in"],
                         "kerf":          kerf
@@ -135,7 +163,7 @@ def nest_1d(parts, stock_options, kerf):
         bins = _optimize_bins(bins, kerf)
 
         # --- Final downsize: shrink each bin to shortest viable stock ---
-        bins = _downsize_bins(bins, available_lengths, stock_by_length, kerf)
+        bins = _downsize_bins(bins, matching_stock, kerf)
 
         # --- Build result records ---
         for b in bins:
@@ -197,10 +225,13 @@ def _optimize_bins(bins, kerf):
             all_moved = True
             for cut in bins[i]["cuts"]:
                 needed = cut["cut_length"] + kerf
-                # Find best-fit target (least remaining space after placement)
+                cut_mat = cut.get("material_name", "")
+                # Find best-fit material-compatible target
                 best_j = None
                 best_rem = float("inf")
                 for j, rem in projected.items():
+                    if not _stock_matches_material(bins[j]["chosen_stock"], cut_mat):
+                        continue
                     if rem >= needed:
                         rem_after = rem - needed
                         if rem_after < best_rem:
@@ -223,19 +254,26 @@ def _optimize_bins(bins, kerf):
     return bins
 
 
-def _downsize_bins(bins, available_lengths, stock_by_length, kerf):
-    """Shrink each bin to the shortest stock that fits all its cuts."""
+def _downsize_bins(bins, matching_stock, kerf):
+    """Shrink each bin to the shortest stock that fits all its cuts —
+    only considering stock entries whose material_name is compatible with
+    the bin's existing material constraint."""
     for b in bins:
         total_needed = sum(c["cut_length"] + kerf for c in b["cuts"])
-        # Find shortest stock that fits
-        for sl in available_lengths:  # already sorted ascending
+        bin_mat = b["chosen_stock"].get("material_name", "")
+        # Compatible candidates: same material constraint as the bin's current stock
+        candidates = sorted(
+            [s for s in matching_stock if (s.get("material_name", "") or "") == (bin_mat or "")],
+            key=lambda x: float(x["length_in"])
+        )
+        for s in candidates:
+            sl = float(s["length_in"])
             if sl >= total_needed:
                 if sl < b["stock_length"]:
                     b["stock_length"] = sl
-                    b["chosen_stock"] = stock_by_length[sl]
+                    b["chosen_stock"] = s
                     b["remaining"] = sl - total_needed
                 elif sl == b["stock_length"]:
-                    # Recalculate remaining in case it drifted
                     b["remaining"] = sl - total_needed
                 break
     return bins

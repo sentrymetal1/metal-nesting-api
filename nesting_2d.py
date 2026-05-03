@@ -8,8 +8,24 @@ Algorithm:
   5. Pack as many additional parts as possible into each sheet
   6. After all packing, downsize any sheet that could use smaller stock
 
-Stock matching: form_type + material_origin
+Stock matching: form_type + material_origin, plus optional material_name
+filter — when a stock entry has material_name set, it only matches parts
+with the same material_name (normalized). Blank = generic.
 """
+
+
+def _norm_mat(s):
+    """Normalize material description for comparison: lowercase, strip all whitespace."""
+    return "".join((s or "").lower().split())
+
+
+def _stock_matches_material(stock_entry, part_material_name):
+    """Stock matches if it has no material_name filter, or its (normalized)
+    material_name equals the part's (normalized) material_name."""
+    sm = stock_entry.get("material_name", "")
+    if not sm:
+        return True
+    return _norm_mat(sm) == _norm_mat(part_material_name)
 
 
 def nest_2d(parts, stock_options, kerf):
@@ -24,6 +40,7 @@ def nest_2d(parts, stock_options, kerf):
                 "part_mark":       part["part_mark"],
                 "bom_line_id":     part["bom_line_id"],
                 "material_type":   part.get("material_type", ""),
+                "material_name":   part.get("material_name", ""),
                 "spec_name":       part.get("spec_name", ""),
                 "length_in":       float(part["length_in"]),
                 "width_in":        float(part["width_in"]),
@@ -97,12 +114,15 @@ def nest_2d(parts, stock_options, kerf):
         sheets = []
 
         for part in remaining_parts:
-            # Try to fit into an existing sheet (prefer sheet with least free area)
+            part_mat = part.get("material_name", "")
+            # Try to fit into an existing material-compatible sheet
             placed = False
             best_sheet = None
             best_free_area = float("inf")
 
             for sheet in sheets:
+                if not _stock_matches_material(sheet["chosen_stock"], part_mat):
+                    continue
                 result = _guillotine_place(sheet["free_rects"], part, kerf, dry_run=True)
                 if result:
                     free_area = sum(r["l"] * r["w"] for r in sheet["free_rects"])
@@ -118,26 +138,36 @@ def nest_2d(parts, stock_options, kerf):
                     placed = True
 
             if not placed:
-                # Open a new sheet — find smallest stock that fits this part
-                chosen_size = None
-                for (sl, sw) in available_sizes:  # sorted smallest first
+                # Open a new sheet — only material-compatible stock
+                compatible_stock = [s for s in matching_stock if _stock_matches_material(s, part_mat)]
+                # Sort smallest area first
+                compatible_sorted = sorted(
+                    compatible_stock,
+                    key=lambda s: float(s["length_in"]) * float(s["width_in"])
+                )
+                chosen_stock = None
+                for s in compatible_sorted:
+                    sl, sw = float(s["length_in"]), float(s["width_in"])
                     if _part_fits_stock(part, sl, sw, kerf):
-                        chosen_size = (sl, sw)
+                        chosen_stock = s
                         break
 
-                if chosen_size is None:
+                if chosen_stock is None:
+                    err = f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}"
+                    if part_mat:
+                        err += f" matching material '{part_mat}'"
                     stock_results.append({
-                        "error": f"Part {part['part_mark']} ({part['length_in']}x{part['width_in']}\") too large for any stock in {form_type} | {mat_origin}.",
+                        "error": err + ".",
                         "form_type": form_type,
                         "material_origin": mat_origin
                     })
                     continue
 
-                sl, sw = chosen_size
+                sl, sw = float(chosen_stock["length_in"]), float(chosen_stock["width_in"])
                 new_sheet = {
                     "stock_l": sl,
                     "stock_w": sw,
-                    "chosen_stock": stock_by_key[chosen_size],
+                    "chosen_stock": chosen_stock,
                     "free_rects": [{"x": 0, "y": 0, "l": sl, "w": sw}],
                     "cuts": []
                 }
@@ -151,7 +181,7 @@ def nest_2d(parts, stock_options, kerf):
         sheets = _optimize_sheets(sheets, kerf)
 
         # --- Final downsize: shrink each sheet to smallest viable stock ---
-        sheets = _downsize_sheets(sheets, available_sizes, stock_by_key, kerf)
+        sheets = _downsize_sheets(sheets, matching_stock, kerf)
 
         # --- Build result records ---
         for sheet in sheets:
@@ -237,6 +267,7 @@ def _optimize_sheets(sheets, kerf):
             moves = []
             all_moved = True
             for cut_info in sheets[i]["cuts"]:
+                cut_mat = cut_info.get("material_name", "")
                 part = {
                     "length_in": cut_info["cut_length"],
                     "width_in": cut_info["cut_width"],
@@ -245,6 +276,8 @@ def _optimize_sheets(sheets, kerf):
                 placed = False
                 for j in range(len(sheets)):
                     if i == j:
+                        continue
+                    if not _stock_matches_material(sheets[j]["chosen_stock"], cut_mat):
                         continue
                     result = _guillotine_place(sheets[j]["free_rects"], part, kerf, dry_run=True)
                     if result:
@@ -269,13 +302,11 @@ def _optimize_sheets(sheets, kerf):
     return sheets
 
 
-def _downsize_sheets(sheets, available_sizes, stock_by_key, kerf):
+def _downsize_sheets(sheets, matching_stock, kerf):
     """After packing, check if any sheet can use a smaller stock panel.
-    
-    For each sheet, compute the bounding box of all placed cuts (including kerf),
-    then find the smallest stock panel that fits that bounding box — trying both
-    normal and rotated orientations of each stock size.
-    """
+
+    Material-aware: only considers stock whose material_name constraint
+    matches the sheet's existing chosen_stock material constraint."""
     for sheet in sheets:
         if not sheet["cuts"]:
             continue
@@ -284,33 +315,36 @@ def _downsize_sheets(sheets, available_sizes, stock_by_key, kerf):
         max_y = max(c["y_position"] + c["cut_width"] + kerf for c in sheet["cuts"])
 
         current_area = sheet["stock_l"] * sheet["stock_w"]
-        best_size = None
+        best_stock = None
         best_area = current_area
 
-        # Find smallest stock that fits the bounding box
-        for (sl, sw) in available_sizes:  # sorted smallest first by area
+        # Compatible candidates: same material constraint as the sheet's current stock
+        sheet_mat = sheet["chosen_stock"].get("material_name", "")
+        candidates = sorted(
+            [s for s in matching_stock if (s.get("material_name", "") or "") == (sheet_mat or "")],
+            key=lambda s: float(s["length_in"]) * float(s["width_in"])
+        )
+
+        for s in candidates:
+            sl = float(s["length_in"])
+            sw = float(s["width_in"])
             stock_area = sl * sw
             if stock_area >= best_area:
-                break  # remaining sizes are all larger, no point checking
+                break
 
-            # Normal orientation: stock length >= bounding box X, stock width >= bounding box Y
             if sl >= max_x and sw >= max_y:
-                if stock_area < best_area:
-                    best_size = (sl, sw)
-                    best_area = stock_area
-                continue  # keep checking — there might be an even smaller stock
-
-            # Rotated stock orientation: swap stock length/width
+                best_stock = s
+                best_area = stock_area
+                continue
             if sw >= max_x and sl >= max_y:
-                if stock_area < best_area:
-                    best_size = (sl, sw)
-                    best_area = stock_area
+                best_stock = s
+                best_area = stock_area
                 continue
 
-        if best_size and best_area < current_area:
-            sheet["stock_l"] = best_size[0]
-            sheet["stock_w"] = best_size[1]
-            sheet["chosen_stock"] = stock_by_key[best_size]
+        if best_stock and best_area < current_area:
+            sheet["stock_l"] = float(best_stock["length_in"])
+            sheet["stock_w"] = float(best_stock["width_in"])
+            sheet["chosen_stock"] = best_stock
 
     return sheets
 
@@ -320,6 +354,7 @@ def _make_cut(part, x, y, rotated):
         "part_mark":              part["part_mark"],
         "bom_line_id":            part["bom_line_id"],
         "material_type":          part.get("material_type", ""),
+        "material_name":          part.get("material_name", ""),
         "spec_name":              part.get("spec_name", ""),
         "cut_length":             part["length_in"],
         "cut_width":              part["width_in"],
