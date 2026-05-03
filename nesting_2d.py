@@ -194,7 +194,11 @@ def nest_2d(parts, stock_options, kerf):
                 "waste_percentage":  waste_pct,
                 "stock_weight_lbs":  round(weight, 3),
                 "svg_layout":        svg,
-                "cuts":              list(cut_summary.values())
+                "cuts":              list(cut_summary.values()),
+                # Per-placement records (one entry per physical part). The frontend
+                # visualization needs every x/y to draw all rects; `cuts` above is
+                # consolidated by (mark, L, W) and only retains one position per group.
+                "placements":        sheet["cuts"]
             })
             stock_sequence += 1
 

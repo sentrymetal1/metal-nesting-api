@@ -143,7 +143,8 @@ def nest_1d(parts, stock_options, kerf):
             chosen_stock = b["chosen_stock"]
             used_length = sum(c["cut_length"] + kerf for c in b["cuts"])
             remaining = stock_length - used_length
-            waste_pct = round((remaining / stock_length) * 100, 2) if stock_length > 0 else 0
+            # Defense-in-depth: never display negative waste even if upstream packing drifts.
+            waste_pct = round((max(remaining, 0) / stock_length) * 100, 2) if stock_length > 0 else 0
             weight = _calc_weight_1d(chosen_stock, used_length, density)
 
             cut_summary = {}
@@ -189,29 +190,27 @@ def _optimize_bins(bins, kerf):
         for i in range(len(bins)):
             if not bins[i]["cuts"]:
                 continue
-            # Try to move ALL cuts from bin[i] to other bins
+            # Project remaining capacity per target bin so multiple planned
+            # moves to the same bin don't all see its original (pre-move) free space.
+            projected = {j: bins[j]["remaining"] for j in range(len(bins)) if j != i}
             moves = []
             all_moved = True
             for cut in bins[i]["cuts"]:
                 needed = cut["cut_length"] + kerf
-                placed = False
                 # Find best-fit target (least remaining space after placement)
                 best_j = None
                 best_rem = float("inf")
-                for j in range(len(bins)):
-                    if i == j:
-                        continue
-                    if bins[j]["remaining"] >= needed:
-                        rem_after = bins[j]["remaining"] - needed
+                for j, rem in projected.items():
+                    if rem >= needed:
+                        rem_after = rem - needed
                         if rem_after < best_rem:
                             best_j = j
                             best_rem = rem_after
-                if best_j is not None:
-                    moves.append((cut, best_j))
-                    placed = True
-                if not placed:
+                if best_j is None:
                     all_moved = False
                     break
+                moves.append((cut, best_j))
+                projected[best_j] -= needed
 
             if all_moved and moves:
                 for cut, target_idx in moves:
