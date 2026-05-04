@@ -147,7 +147,12 @@ def nest_2d(parts, stock_options, kerf):
         def _try_place_2d(part, tagged_only):
             """Try to place a part into an existing sheet or open a new one.
             If tagged_only=True, restrict to stock/sheets specifically tagged for
-            this part's material_name. Returns True if placed."""
+            this part's material_name. Returns True if placed.
+
+            Each sheet is locked to its first part's material_name — so a
+            library generic sheet becomes single-material once anything is on
+            it (matches reality: you can't physically cut two different plate
+            specs out of the same sheet)."""
             part_mat = part.get("material_name", "")
 
             # Existing sheet fit
@@ -155,6 +160,9 @@ def nest_2d(parts, stock_options, kerf):
             best_free_area = float("inf")
             for sheet in sheets:
                 if not _stock_matches_material(sheet["chosen_stock"], part_mat):
+                    continue
+                lock = sheet.get("material_lock", "")
+                if lock and _norm_mat(lock) != _norm_mat(part_mat):
                     continue
                 if tagged_only and not _stock_is_tagged_for(sheet["chosen_stock"], part_mat):
                     continue
@@ -193,11 +201,12 @@ def nest_2d(parts, stock_options, kerf):
 
             sl, sw = float(chosen_stock["length_in"]), float(chosen_stock["width_in"])
             new_sheet = {
-                "stock_l": sl,
-                "stock_w": sw,
-                "chosen_stock": chosen_stock,
-                "free_rects": [{"x": 0, "y": 0, "l": sl, "w": sw}],
-                "cuts": []
+                "stock_l":       sl,
+                "stock_w":       sw,
+                "chosen_stock":  chosen_stock,
+                "material_lock": part_mat,
+                "free_rects":    [{"x": 0, "y": 0, "l": sl, "w": sw}],
+                "cuts":          []
             }
             result = _guillotine_place(new_sheet["free_rects"], part, kerf, dry_run=False)
             if result:
@@ -272,6 +281,7 @@ def nest_2d(parts, stock_options, kerf):
                 "nesting_type":      "2D - Panel",
                 "form_type":         form_type,
                 "material_origin":   mat_origin,
+                "material_name":     sheet.get("material_lock", ""),
                 "thickness_in":      thickness,
                 "stock_id":          chosen_stock["stock_id"],
                 "stock_label":       chosen_stock["stock_label"],
@@ -337,6 +347,9 @@ def _optimize_sheets(sheets, kerf):
                     if i == j:
                         continue
                     if not _stock_matches_material(sheets[j]["chosen_stock"], cut_mat):
+                        continue
+                    target_lock = sheets[j].get("material_lock", "")
+                    if target_lock and _norm_mat(target_lock) != _norm_mat(cut_mat):
                         continue
                     result = _guillotine_place(sheets[j]["free_rects"], part, kerf, dry_run=True)
                     if result:

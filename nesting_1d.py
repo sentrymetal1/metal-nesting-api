@@ -142,7 +142,12 @@ def nest_1d(parts, stock_options, kerf):
         def _try_place(cut, needed, tagged_only):
             """Try to place a cut into an existing bin or open a new one.
             If tagged_only=True, only consider stock/bins specifically tagged for
-            this cut's material_name (skip generic). Returns True if placed."""
+            this cut's material_name (skip generic). Returns True if placed.
+
+            Each bin is locked to the material_name of its first cut — so a
+            library generic stick becomes single-material once anything is on
+            it. This prevents physically impossible nests (e.g. L6 x 4 x 3/8
+            and L6 x 3-1/2 x 5/16 cuts on the same stick)."""
             cut_mat = cut.get("material_name", "")
 
             # Existing bin fit
@@ -150,6 +155,10 @@ def nest_1d(parts, stock_options, kerf):
             best_remaining = float("inf")
             for b in bins:
                 if not _stock_matches_material(b["chosen_stock"], cut_mat):
+                    continue
+                # Bin-level material lock — only cuts of the bin's material can join
+                lock = b.get("material_lock", "")
+                if lock and _norm_mat(lock) != _norm_mat(cut_mat):
                     continue
                 if tagged_only and not _stock_is_tagged_for(b["chosen_stock"], cut_mat):
                     continue
@@ -179,10 +188,11 @@ def nest_1d(parts, stock_options, kerf):
 
             chosen_length = float(chosen_stock["length_in"])
             bins.append({
-                "stock_length": chosen_length,
-                "chosen_stock": chosen_stock,
-                "remaining":    chosen_length - needed,
-                "cuts":         [_new_cut_record(cut)]
+                "stock_length":  chosen_length,
+                "chosen_stock":  chosen_stock,
+                "material_lock": cut_mat,
+                "remaining":     chosen_length - needed,
+                "cuts":          [_new_cut_record(cut)]
             })
             return True
 
@@ -256,6 +266,7 @@ def nest_1d(parts, stock_options, kerf):
                 "nesting_type":      "1D - Length",
                 "form_type":         form_type,
                 "material_origin":   mat_origin,
+                "material_name":     b.get("material_lock", ""),
                 "stock_id":          chosen_stock["stock_id"],
                 "stock_label":       chosen_stock["stock_label"],
                 "stock_length_in":   stock_length,
@@ -287,11 +298,14 @@ def _optimize_bins(bins, kerf):
             for cut in bins[i]["cuts"]:
                 needed = cut["cut_length"] + kerf
                 cut_mat = cut.get("material_name", "")
-                # Find best-fit material-compatible target
+                # Find best-fit material-compatible target (stock-level AND bin-level)
                 best_j = None
                 best_rem = float("inf")
                 for j, rem in projected.items():
                     if not _stock_matches_material(bins[j]["chosen_stock"], cut_mat):
+                        continue
+                    target_lock = bins[j].get("material_lock", "")
+                    if target_lock and _norm_mat(target_lock) != _norm_mat(cut_mat):
                         continue
                     if rem >= needed:
                         rem_after = rem - needed
