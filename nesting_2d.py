@@ -313,13 +313,20 @@ def _part_fits_any_stock(part, available_sizes, kerf):
 
 
 def _part_fits_stock(part, stock_l, stock_w, kerf):
-    """Check if a part can fit on a stock panel (with or without rotation)."""
+    """Check if a part can fit on a stock panel (with or without rotation).
+
+    Kerf is reserved BETWEEN parts (during split after placement), not at the
+    stock edge — so the fit check requires only stock_dim >= part_dim, not
+    stock_dim >= part_dim + kerf. The previous strict-kerf check failed when
+    a part dimension exactly equaled a stock subdivision (e.g. 24x24 part on
+    48x96 stock — math/24 = 2/4 exactly, so kerf reserve made it appear to
+    not fit even though only 1 internal cut is needed)."""
     pl, pw = part["length_in"], part["width_in"]
     grain = part.get("grain_direction", "none")
-    if stock_l >= pl + kerf and stock_w >= pw + kerf:
+    if stock_l >= pl and stock_w >= pw:
         return True
     if grain == "none":
-        if stock_l >= pw + kerf and stock_w >= pl + kerf:
+        if stock_l >= pw and stock_w >= pl:
             return True
     return False
 
@@ -458,15 +465,16 @@ def _guillotine_place(free_rects, part, kerf, dry_run=False):
 
     for rect in free_rects:
         rl, rw = rect["l"], rect["w"]
-        # Normal orientation
-        if rl >= part_l + kerf and rw >= part_w + kerf:
+        # Normal orientation. Kerf reserved when splitting remaining space, not
+        # required at edges (see _part_fits_stock for rationale).
+        if rl >= part_l and rw >= part_w:
             area = rl * rw
             if area < best_area:
                 best = (rect, False)
                 best_area = area
         # Rotated orientation (only if grain allows)
         if grain == "none":
-            if rl >= part_w + kerf and rw >= part_l + kerf:
+            if rl >= part_w and rw >= part_l:
                 area = rl * rw
                 if area < best_area:
                     best = (rect, True)
