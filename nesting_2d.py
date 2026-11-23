@@ -12,6 +12,7 @@ Stock matching: form_type + material_origin, plus optional material_name
 filter — when a stock entry has material_name set, it only matches parts
 with the same material_name (normalized). Blank = generic.
 """
+import copy
 
 
 def _norm_mat(s):
@@ -340,6 +341,12 @@ def _optimize_sheets(sheets, kerf):
         for i in range(len(sheets)):
             if not sheets[i]["cuts"]:
                 continue
+            # Trial-place every cut on COPIES of the other sheets' free space, consuming it as we
+            # go. The old version checked each cut with dry_run against the SAME untouched free
+            # space, so 20 parts could all "fit" in one leftover gap; the real placement then
+            # failed for most of them and they were silently dropped when this sheet was emptied
+            # (2026-11-23: 100 plates in, 80 out, no error). Commit only if every cut really fits.
+            trial = {j: copy.deepcopy(sheets[j]["free_rects"]) for j in range(len(sheets)) if j != i}
             moves = []
             all_moved = True
             for cut_info in sheets[i]["cuts"]:
@@ -358,9 +365,9 @@ def _optimize_sheets(sheets, kerf):
                     target_lock = sheets[j].get("material_lock", "")
                     if target_lock and _norm_mat(target_lock) != _norm_mat(cut_mat):
                         continue
-                    result = _guillotine_place(sheets[j]["free_rects"], part, kerf, dry_run=True)
+                    result = _guillotine_place(trial[j], part, kerf, dry_run=False)
                     if result:
-                        moves.append((cut_info, j, part))
+                        moves.append((cut_info, j, result))
                         placed = True
                         break
                 if not placed:
@@ -368,12 +375,12 @@ def _optimize_sheets(sheets, kerf):
                     break
 
             if all_moved and moves:
-                for cut_info, target_idx, part in moves:
-                    result = _guillotine_place(sheets[target_idx]["free_rects"], part, kerf, dry_run=False)
-                    if result:
-                        x, y, rotated = result
-                        new_cut = {**cut_info, "x_position": round(x, 4), "y_position": round(y, 4)}
-                        sheets[target_idx]["cuts"].append(new_cut)
+                for j, rects in trial.items():
+                    sheets[j]["free_rects"] = rects
+                for cut_info, target_idx, (x, y, rotated) in moves:
+                    new_cut = {**cut_info, "x_position": round(x, 4), "y_position": round(y, 4),
+                               "rotation": 90 if rotated else 0}
+                    sheets[target_idx]["cuts"].append(new_cut)
                 sheets[i]["cuts"] = []
                 improved = True
 
